@@ -865,10 +865,11 @@ class AnnotatorMultiPassTest(absltest.TestCase):
     self.assertEqual(self.mock_language_model.infer.call_count, 2)
 
   def test_multipass_extraction_overlapping(self):
-    """Test multi-pass extraction with overlapping extractions (first pass wins)."""
+    """Test multi-pass extraction with overlapping extractions (largest span wins)."""
     text = "Dr. Smith prescribed aspirin."
 
-    # Mock overlapping extractions - both passes find "Smith" but differently
+    # Mock overlapping extractions - both passes find "Smith" but differently.
+    # The first pass yields the larger span ("Dr. Smith"), so it wins.
     self.mock_language_model.infer.side_effect = [
         [[
             types.ScoredOutput(
@@ -909,11 +910,64 @@ class AnnotatorMultiPassTest(absltest.TestCase):
     extraction_classes = [e.extraction_class for e in result.extractions]
     self.assertCountEqual(extraction_classes, ["doctor", "medication"])
 
-    # Verify "Dr. Smith" from first pass is kept, not "Smith" from second pass
+    # Verify "Dr. Smith" (larger span) is kept, not "Smith" from second pass
     doctor_extraction = next(
         e for e in result.extractions if e.extraction_class == "doctor"
     )
     self.assertEqual(doctor_extraction.extraction_text, "Dr. Smith")
+
+  def test_multipass_extraction_overlapping_larger_later_pass_wins(self):
+    """Test that a larger span from a later pass wins over an earlier smaller one."""
+    text = "Dr. Smith prescribed aspirin."
+
+    # First pass finds only "Smith"; second pass finds the larger "Dr. Smith".
+    # Largest-span-wins should keep "Dr. Smith" from the second pass.
+    self.mock_language_model.infer.side_effect = [
+        [[
+            types.ScoredOutput(
+                score=1.0,
+                output=textwrap.dedent(f"""\
+              ```yaml
+              {data.EXTRACTIONS_KEY}:
+              - patient: "Smith"
+                patient_index: 1
+              ```"""),
+            )
+        ]],
+        [[
+            types.ScoredOutput(
+                score=1.0,
+                output=textwrap.dedent(f"""\
+              ```yaml
+              {data.EXTRACTIONS_KEY}:
+              - doctor: "Dr. Smith"
+                doctor_index: 0
+              - medication: "aspirin"
+                medication_index: 2
+              ```"""),
+            )
+        ]],
+    ]
+
+    resolver = resolver_lib.Resolver(
+        format_type=data.FormatType.YAML,
+        extraction_index_suffix=resolver_lib.DEFAULT_INDEX_SUFFIX,
+    )
+
+    result = self.annotator.annotate_text(
+        text, resolver=resolver, extraction_passes=2, debug=False
+    )
+
+    self.assertLen(result.extractions, 2)
+    extraction_classes = [e.extraction_class for e in result.extractions]
+    self.assertCountEqual(extraction_classes, ["doctor", "medication"])
+
+    # The larger "Dr. Smith" span from the second pass wins over "Smith".
+    doctor_extraction = next(
+        e for e in result.extractions if e.extraction_class == "doctor"
+    )
+    self.assertEqual(doctor_extraction.extraction_text, "Dr. Smith")
+    self.assertNotIn("patient", extraction_classes)
 
   def test_multipass_extraction_single_pass(self):
     """Test that extraction_passes=1 behaves like normal single-pass extraction."""
@@ -1110,7 +1164,7 @@ class MultiPassHelperFunctionsTest(parameterized.TestCase):
           expected_classes=["class1", "class2"],
       ),
       dict(
-          testcase_name="overlapping_passes_first_wins",
+          testcase_name="overlapping_equal_length_earlier_pass_wins",
           all_extractions=[
               [
                   data.Extraction(
@@ -1120,7 +1174,7 @@ class MultiPassHelperFunctionsTest(parameterized.TestCase):
               [
                   data.Extraction(
                       "class2", "text2", char_interval=data.CharInterval(5, 15)
-                  ),  # Overlaps
+                  ),  # Overlaps, equal length -> earlier pass wins
                   data.Extraction(
                       "class3", "text3", char_interval=data.CharInterval(20, 25)
                   ),  # No overlap
@@ -1130,7 +1184,24 @@ class MultiPassHelperFunctionsTest(parameterized.TestCase):
           expected_classes=[
               "class1",
               "class3",
-          ],  # class2 excluded due to overlap
+          ],  # class2 excluded: same length as class1, later pass loses tie
+      ),
+      dict(
+          testcase_name="overlapping_larger_later_pass_wins",
+          all_extractions=[
+              [
+                  data.Extraction(
+                      "class1", "text1", char_interval=data.CharInterval(5, 10)
+                  )  # Smaller span from earlier pass
+              ],
+              [
+                  data.Extraction(
+                      "class2", "text2", char_interval=data.CharInterval(0, 15)
+                  )  # Larger overlapping span from later pass wins
+              ],
+          ],
+          expected_count=1,
+          expected_classes=["class2"],  # class1 evicted by larger class2
       ),
   )
   def test_merge_non_overlapping_extractions(

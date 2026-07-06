@@ -50,16 +50,20 @@ def _merge_non_overlapping_extractions(
   """Merges extractions from multiple extraction passes.
 
   When extractions from different passes overlap in their character positions,
-  the extraction from the earlier pass is kept (first-pass wins strategy).
-  Only non-overlapping extractions from later passes are added to the result.
+  the extraction with the largest span is kept (largest-span wins strategy).
+  Extractions are considered largest-first, so a large span from a later pass
+  can displace smaller overlapping spans from earlier passes. Ties in span
+  length are broken in favor of the earlier pass (and earlier position within a
+  pass). Extractions without a resolved character interval never overlap and are
+  always kept.
 
   Args:
     all_extractions: List of extraction iterables from different sequential
       extraction passes, ordered by pass number.
 
   Returns:
-    List of merged extractions with overlaps resolved in favor of earlier
-    passes.
+    List of merged, non-overlapping extractions in original discovery order
+    (pass order, then position within a pass).
   """
   if not all_extractions:
     return []
@@ -67,22 +71,41 @@ def _merge_non_overlapping_extractions(
   if len(all_extractions) == 1:
     return list(all_extractions[0])
 
-  merged_extractions = list(all_extractions[0])
+  # Flatten in discovery order: pass 0 first, then within-pass order. The
+  # enumerated index encodes this ordering and drives tie-breaking.
+  flat_extractions: list[data.Extraction] = []
+  for pass_extractions in all_extractions:
+    flat_extractions.extend(pass_extractions)
 
-  for pass_extractions in all_extractions[1:]:
-    for extraction in pass_extractions:
-      overlaps = False
-      if extraction.char_interval is not None:
-        for existing_extraction in merged_extractions:
-          if existing_extraction.char_interval is not None:
-            if _extractions_overlap(extraction, existing_extraction):
-              overlaps = True
-              break
+  def _span_length(extraction: data.Extraction) -> int:
+    char_interval = extraction.char_interval
+    if (
+        char_interval is None
+        or char_interval.start_pos is None
+        or char_interval.end_pos is None
+    ):
+      return -1
+    return char_interval.end_pos - char_interval.start_pos
 
-      if not overlaps:
-        merged_extractions.append(extraction)
+  # Largest spans first; stable tie-break by discovery index keeps the
+  # earlier-pass extraction ahead when spans have equal length.
+  selection_order = sorted(
+      enumerate(flat_extractions),
+      key=lambda pair: (-_span_length(pair[1]), pair[0]),
+  )
 
-  return merged_extractions
+  kept: list[tuple[int, data.Extraction]] = []
+  for original_index, extraction in selection_order:
+    if any(
+        _extractions_overlap(extraction, existing)
+        for _, existing in kept
+    ):
+      continue
+    kept.append((original_index, extraction))
+
+  # Emit in original discovery order rather than largest-first order.
+  kept.sort(key=lambda pair: pair[0])
+  return [extraction for _, extraction in kept]
 
 
 def _extractions_overlap(

@@ -155,8 +155,9 @@ def extract(
       extraction_passes: Number of sequential extraction attempts to improve
         recall and find additional entities. Defaults to 1 (standard single
         extraction). When > 1, the system performs multiple independent
-        extractions and merges non-overlapping results (first extraction wins
-        for overlaps). WARNING: Each additional pass reprocesses tokens,
+        extractions and merges non-overlapping results (when extractions
+        overlap, the largest span wins; ties are broken toward earlier passes).
+        WARNING: Each additional pass reprocesses tokens,
         potentially increasing API costs. For example, extraction_passes=3
         reprocesses tokens 3x.
       chunk_size_jitter: Randomizes chunk boundaries across extraction passes to
