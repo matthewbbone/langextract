@@ -62,6 +62,7 @@ def extract(
     debug: bool = False,
     model_url: str | None = None,
     extraction_passes: int = 1,
+    chunk_size_jitter: float = 0.0,
     context_window_chars: int | None = None,
     config: typing.Any = None,
     model: typing.Any = None,
@@ -158,6 +159,17 @@ def extract(
         for overlaps). WARNING: Each additional pass reprocesses tokens,
         potentially increasing API costs. For example, extraction_passes=3
         reprocesses tokens 3x.
+      chunk_size_jitter: Randomizes chunk boundaries across extraction passes to
+        improve recall for large spans that may be split at chunk boundaries.
+        The value is the half-width of the multiplier range applied to
+        max_char_buffer: on every pass after the first, the effective buffer is
+        drawn uniformly from
+        [max_char_buffer * (1 - chunk_size_jitter),
+         max_char_buffer * (1 + chunk_size_jitter)]. Defaults to 0.0 (no jitter;
+        identical chunking every pass). Randomization is seeded by pass index so
+        results are reproducible. Only has an effect when extraction_passes > 1.
+        Note that values above 0 may produce some chunks larger than
+        max_char_buffer.
       context_window_chars: Number of characters from the previous chunk to
         include as context for the current chunk. This helps with coreference
         resolution across chunk boundaries (e.g., resolving "She" to a person
@@ -394,6 +406,7 @@ def extract(
         additional_context=additional_context,
         debug=debug,
         extraction_passes=extraction_passes,
+        chunk_size_jitter=chunk_size_jitter,
         context_window_chars=context_window_chars,
         show_progress=show_progress,
         max_workers=max_workers,
@@ -418,6 +431,7 @@ def extract(
         batch_length=batch_length,
         debug=debug,
         extraction_passes=extraction_passes,
+        chunk_size_jitter=chunk_size_jitter,
         context_window_chars=context_window_chars,
         show_progress=show_progress,
         max_workers=max_workers,

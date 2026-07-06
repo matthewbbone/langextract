@@ -984,6 +984,90 @@ class AnnotatorMultiPassTest(absltest.TestCase):
     self.assertLen(result.extractions, 1)
     self.assertEqual(result.extractions[0].extraction_class, "test")
 
+  def _capture_pass_buffers(self, text, resolver, **kwargs):
+    """Runs annotate_text and returns the max_char_buffer used per pass."""
+    self.mock_language_model.infer.return_value = [[
+        types.ScoredOutput(
+            score=1.0,
+            output=textwrap.dedent(f"""\
+              ```yaml
+              {data.EXTRACTIONS_KEY}: []
+              ```"""),
+        )
+    ]]
+    with mock.patch.object(
+        annotation,
+        "_document_chunk_iterator",
+        wraps=annotation._document_chunk_iterator,
+    ) as spy:
+      self.annotator.annotate_text(text, resolver=resolver, **kwargs)
+    # _document_chunk_iterator is called once per pass with max_char_buffer as
+    # its second positional argument.
+    return [call.args[1] for call in spy.call_args_list]
+
+  def test_chunk_size_jitter_zero_keeps_buffer_constant(self):
+    """chunk_size_jitter=0.0 uses the same buffer for every pass (baseline)."""
+    resolver = resolver_lib.Resolver(format_type=data.FormatType.YAML)
+
+    buffers = self._capture_pass_buffers(
+        "Patient John Smith has diabetes and takes insulin daily.",
+        resolver,
+        max_char_buffer=200,
+        extraction_passes=3,
+        chunk_size_jitter=0.0,
+        debug=False,
+    )
+
+    self.assertEqual(buffers, [200, 200, 200])
+
+  def test_chunk_size_jitter_varies_buffer_after_first_pass(self):
+    """chunk_size_jitter shifts the buffer on later passes, deterministically."""
+    resolver = resolver_lib.Resolver(format_type=data.FormatType.YAML)
+    text = "Patient John Smith has diabetes and takes insulin daily."
+
+    buffers = self._capture_pass_buffers(
+        text,
+        resolver,
+        max_char_buffer=200,
+        extraction_passes=3,
+        chunk_size_jitter=0.5,
+        debug=False,
+    )
+
+    self.assertLen(buffers, 3)
+    # Pass 0 is always the exact baseline buffer.
+    self.assertEqual(buffers[0], 200)
+    # Later passes are jittered within [200*(1-0.5), 200*(1+0.5)] = [100, 300].
+    for buffer in buffers[1:]:
+      self.assertGreaterEqual(buffer, 100)
+      self.assertLessEqual(buffer, 300)
+    # Jitter actually moved at least one boundary off the baseline.
+    self.assertNotEqual(buffers[1:], [200, 200])
+
+    # Seeded by pass index, so a second run reproduces the same buffers.
+    buffers_again = self._capture_pass_buffers(
+        text,
+        resolver,
+        max_char_buffer=200,
+        extraction_passes=3,
+        chunk_size_jitter=0.5,
+        debug=False,
+    )
+    self.assertEqual(buffers, buffers_again)
+
+  def test_chunk_size_jitter_negative_raises(self):
+    """A negative chunk_size_jitter is rejected."""
+    resolver = resolver_lib.Resolver(format_type=data.FormatType.YAML)
+
+    with self.assertRaises(ValueError):
+      self.annotator.annotate_text(
+          "Test text.",
+          resolver=resolver,
+          extraction_passes=2,
+          chunk_size_jitter=-0.1,
+          debug=False,
+      )
+
 
 class MultiPassHelperFunctionsTest(parameterized.TestCase):
   """Tests for multi-pass helper functions."""

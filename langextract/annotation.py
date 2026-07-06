@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import collections
 from collections.abc import Iterable, Iterator
+import random
 import time
 from typing import DefaultDict
 
@@ -214,6 +215,7 @@ class Annotator:
       batch_length: int = 1,
       debug: bool = True,
       extraction_passes: int = 1,
+      chunk_size_jitter: float = 0.0,
       context_window_chars: int | None = None,
       show_progress: bool = True,
       tokenizer: tokenizer_lib.Tokenizer | None = None,
@@ -239,6 +241,16 @@ class Annotator:
         standard single extraction.
         Values > 1 reprocess tokens multiple times, potentially increasing
         costs with the potential for a more thorough extraction.
+      chunk_size_jitter: Randomizes chunk boundaries across extraction passes to
+        improve recall for large spans that may be split at chunk boundaries.
+        The value is the half-width of the multiplier range applied to
+        max_char_buffer: on every pass after the first, the effective buffer is
+        drawn uniformly from
+        [max_char_buffer * (1 - chunk_size_jitter),
+         max_char_buffer * (1 + chunk_size_jitter)].
+        Defaults to 0.0 (no jitter; identical chunking every pass). Only has an
+        effect when extraction_passes > 1. Note that values above 0 may produce
+        some chunks larger than max_char_buffer.
       context_window_chars: Number of characters from the previous chunk to
         include as context for the current chunk. Helps with coreference
         resolution across chunk boundaries. Defaults to None (disabled).
@@ -255,6 +267,11 @@ class Annotator:
     """
     if resolver is None:
       resolver = resolver_lib.Resolver(format_type=data.FormatType.YAML)
+
+    if chunk_size_jitter < 0.0:
+      raise ValueError(
+          f"chunk_size_jitter must be non-negative, got {chunk_size_jitter}."
+      )
 
     if extraction_passes == 1:
       yield from self._annotate_documents_single_pass(
@@ -279,6 +296,7 @@ class Annotator:
           show_progress,
           context_window_chars=context_window_chars,
           tokenizer=tokenizer,
+          chunk_size_jitter=chunk_size_jitter,
           **kwargs,
       )
 
@@ -455,9 +473,18 @@ class Annotator:
       show_progress: bool = True,
       context_window_chars: int | None = None,
       tokenizer: tokenizer_lib.Tokenizer | None = None,
+      chunk_size_jitter: float = 0.0,
       **kwargs,
   ) -> Iterator[data.AnnotatedDocument]:
-    """Sequential extraction passes logic for improved recall."""
+    """Sequential extraction passes logic for improved recall.
+
+    When chunk_size_jitter > 0, passes after the first randomize the chunk size
+    around max_char_buffer so that chunk boundaries shift between passes. This
+    improves recall for large spans that would otherwise be split at the same
+    boundary in every pass. Pass 0 always uses max_char_buffer unchanged, and
+    the per-pass randomization is seeded deterministically by pass index so
+    results are reproducible.
+    """
 
     logging.info(
         "Starting sequential extraction passes for improved recall with %d"
@@ -475,14 +502,31 @@ class Annotator:
       document_texts[_doc.document_id] = _doc.text or ""
 
     for pass_num in range(extraction_passes):
+      # Pass 0 always uses the exact max_char_buffer for a deterministic
+      # baseline; later passes jitter the buffer (when enabled) so chunk
+      # boundaries shift and large spans split in one pass can land whole in
+      # another. Seeded by pass index for reproducibility.
+      if pass_num == 0 or chunk_size_jitter == 0.0:
+        pass_char_buffer = max_char_buffer
+      else:
+        rng = random.Random(pass_num)
+        low = max(0.1, 1.0 - chunk_size_jitter)
+        high = 1.0 + chunk_size_jitter
+        pass_char_buffer = max(
+            1, round(max_char_buffer * rng.uniform(low, high))
+        )
+
       logging.info(
-          "Starting extraction pass %d of %d", pass_num + 1, extraction_passes
+          "Starting extraction pass %d of %d (max_char_buffer=%d)",
+          pass_num + 1,
+          extraction_passes,
+          pass_char_buffer,
       )
 
       for annotated_doc in self._annotate_documents_single_pass(
           document_list,
           resolver,
-          max_char_buffer,
+          pass_char_buffer,
           batch_length,
           debug=(debug and pass_num == 0),
           show_progress=show_progress if pass_num == 0 else False,
@@ -538,6 +582,7 @@ class Annotator:
       additional_context: str | None = None,
       debug: bool = True,
       extraction_passes: int = 1,
+      chunk_size_jitter: float = 0.0,
       context_window_chars: int | None = None,
       show_progress: bool = True,
       tokenizer: tokenizer_lib.Tokenizer | None = None,
@@ -557,6 +602,10 @@ class Annotator:
         recall by finding additional entities. Defaults to 1, which performs
         standard single extraction. Values > 1 reprocess tokens multiple times,
         potentially increasing costs.
+      chunk_size_jitter: Randomizes chunk boundaries across extraction passes to
+        improve recall for large spans that may be split at chunk boundaries.
+        Defaults to 0.0 (no jitter). See annotate_documents for details. Only
+        has an effect when extraction_passes > 1.
       context_window_chars: Number of characters from the previous chunk to
         include as context for coreference resolution. Defaults to None
         (disabled).
@@ -586,6 +635,7 @@ class Annotator:
         self.annotate_documents(
             documents=documents,
             resolver=resolver,
+            chunk_size_jitter=chunk_size_jitter,
             max_char_buffer=max_char_buffer,
             batch_length=batch_length,
             debug=debug,
