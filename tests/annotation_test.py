@@ -856,7 +856,7 @@ class AnnotatorMultipleDocumentTest(parameterized.TestCase):
       )
 
 
-class AnnotatorMultiPassTest(absltest.TestCase):
+class AnnotatorMultiPassTest(parameterized.TestCase):
   """Tests for multi-pass extraction functionality."""
 
   def setUp(self):
@@ -920,7 +920,7 @@ class AnnotatorMultiPassTest(absltest.TestCase):
     self.assertEqual(self.mock_language_model.infer.call_count, 2)
 
   def test_multipass_extraction_overlapping(self):
-    """Test multi-pass extraction with overlapping extractions (first pass wins)."""
+    """The largest overlap wins and records the dropped attributes."""
     text = "Dr. Smith prescribed aspirin."
 
     # Mock overlapping extractions - both passes find "Smith" but differently
@@ -944,6 +944,9 @@ class AnnotatorMultiPassTest(absltest.TestCase):
               {data.EXTRACTIONS_KEY}:
               - patient: "Smith"
                 patient_index: 1
+                patient_attributes:
+                  context: "secondary pass"
+                  beneficiary: "patient"
               - medication: "aspirin"
                 medication_index: 2
               ```"""),
@@ -969,6 +972,10 @@ class AnnotatorMultiPassTest(absltest.TestCase):
         e for e in result.extractions if e.extraction_class == "doctor"
     )
     self.assertEqual(doctor_extraction.extraction_text, "Dr. Smith")
+    self.assertEqual(
+        doctor_extraction.dropped_attributes,
+        [{"context": "secondary pass", "beneficiary": "patient"}],
+    )
 
   def test_multipass_extraction_single_pass(self):
     """Test that extraction_passes=1 behaves like normal single-pass extraction."""
@@ -1039,15 +1046,18 @@ class AnnotatorMultiPassTest(absltest.TestCase):
     self.assertLen(result.extractions, 1)
     self.assertEqual(result.extractions[0].extraction_class, "test")
 
-  def test_multipass_chunk_offset_shifts_per_pass(self):
-    """Each pass shifts its first-chunk cap by max_char_buffer // passes."""
+  @parameterized.named_parameters(
+      ("scalar", 30, [30, 30, 30]),
+      ("schedule", [20, 30, 40], [20, 30, 40]),
+  )
+  def test_multipass_uses_configured_chunk_size_per_pass(
+      self, max_char_buffer, expected_sizes
+  ):
     text = (
         "Patient John Smith has diabetes and takes insulin daily every"
         " morning without fail."
     )
 
-    # Same output for every chunk/pass; this test only checks the per-pass
-    # offset forwarded to ChunkIterator, not the resolved extractions.
     self.mock_language_model.infer.return_value = [[
         types.ScoredOutput(
             score=1.0,
@@ -1065,12 +1075,18 @@ class AnnotatorMultiPassTest(absltest.TestCase):
         extraction_index_suffix=resolver_lib.DEFAULT_INDEX_SUFFIX,
     )
 
-    captured_offsets = []
+    captured_sizes = []
+    captured_intervals = []
     real_chunk_iterator = annotation.chunking.ChunkIterator
 
     def _record(*args, **kwargs):
-      captured_offsets.append(kwargs.get("first_chunk_max_char"))
-      return real_chunk_iterator(*args, **kwargs)
+      captured_sizes.append(kwargs["max_char_buffer"])
+      chunks = list(real_chunk_iterator(*args, **kwargs))
+      captured_intervals.append([
+          (chunk.token_interval.start_index, chunk.token_interval.end_index)
+          for chunk in chunks
+      ])
+      return iter(chunks)
 
     with mock.patch.object(
         annotation.chunking, "ChunkIterator", side_effect=_record
@@ -1078,13 +1094,38 @@ class AnnotatorMultiPassTest(absltest.TestCase):
       self.annotator.annotate_text(
           text,
           resolver=resolver,
-          max_char_buffer=30,
+          max_char_buffer=max_char_buffer,
           extraction_passes=3,
           debug=False,
       )
 
-    # adjustment = 30 // 3 = 10; pass 0 is the unshifted baseline (None).
-    self.assertEqual(captured_offsets, [None, 10, 20])
+    self.assertEqual(captured_sizes, expected_sizes)
+    if isinstance(max_char_buffer, int):
+      self.assertTrue(
+          all(
+              intervals == captured_intervals[0]
+              for intervals in captured_intervals[1:]
+          )
+      )
+    else:
+      self.assertGreater(len({tuple(x) for x in captured_intervals}), 1)
+
+  def test_single_pass_accepts_one_element_schedule(self):
+    self.mock_language_model.infer.return_value = [[
+        types.ScoredOutput(
+            score=1.0,
+            output=f"```yaml\n{data.EXTRACTIONS_KEY}: []\n```",
+        )
+    ]]
+
+    self.annotator.annotate_text(
+        "Patient has fever.",
+        max_char_buffer=[100],
+        extraction_passes=1,
+        debug=False,
+    )
+
+    self.mock_language_model.infer.assert_called_once()
 
   def test_multipass_custom_tokenizer_runs_once_per_document(self):
     text = "# Status\n\nPatient has fever."
@@ -1106,6 +1147,38 @@ class AnnotatorMultiPassTest(absltest.TestCase):
     )
 
     custom_tokenizer.tokenize.assert_called_once_with(text)
+
+  @parameterized.named_parameters(
+      ("empty_schedule", [], 1, ValueError, "schedule length"),
+      ("short_schedule", [10], 2, ValueError, "schedule length"),
+      ("long_schedule", [10, 20], 1, ValueError, "schedule length"),
+      ("zero_size", [10, 0], 2, ValueError, "greater than 0"),
+      ("negative_size", [10, -1], 2, ValueError, "greater than 0"),
+      ("boolean_size", [10, True], 2, TypeError, "must be integers"),
+      ("float_size", [10, 2.5], 2, TypeError, "must be integers"),
+      ("tuple_schedule", (10, 20), 2, TypeError, "integer or a list"),
+      ("boolean_scalar", True, 1, TypeError, "integer or a list"),
+      ("zero_scalar", 0, 1, ValueError, "greater than 0"),
+      ("negative_scalar", -1, 1, ValueError, "greater than 0"),
+      ("zero_passes", 10, 0, ValueError, "extraction_passes"),
+      ("boolean_passes", 10, True, TypeError, "extraction_passes"),
+  )
+  def test_invalid_chunk_schedules_fail_before_inference(
+      self,
+      max_char_buffer,
+      extraction_passes,
+      error_type,
+      error_pattern,
+  ):
+    with self.assertRaisesRegex(error_type, error_pattern):
+      self.annotator.annotate_text(
+          "Patient has fever.",
+          max_char_buffer=max_char_buffer,
+          extraction_passes=extraction_passes,
+          debug=False,
+      )
+
+    self.mock_language_model.infer.assert_not_called()
 
 
 class MultiPassHelperFunctionsTest(parameterized.TestCase):
@@ -1204,6 +1277,99 @@ class MultiPassHelperFunctionsTest(parameterized.TestCase):
     if expected_classes:
       extraction_classes = [e.extraction_class for e in result]
       self.assertCountEqual(extraction_classes, expected_classes)
+
+  def test_merge_preserves_dropped_attributes_in_discovery_order(self):
+    existing = {"source": "existing"}
+    winner = data.Extraction(
+        "winner",
+        "full span",
+        char_interval=data.CharInterval(0, 20),
+        attributes={"status": "selected"},
+        dropped_attributes=[existing],
+    )
+    first_dropped = data.Extraction(
+        "partial",
+        "first",
+        char_interval=data.CharInterval(2, 6),
+        attributes={"context": "same", "tags": ["one"]},
+    )
+    second_dropped = data.Extraction(
+        "partial",
+        "second",
+        char_interval=data.CharInterval(8, 12),
+        attributes={"context": "same", "tags": ["one"]},
+    )
+
+    result = annotation._merge_non_overlapping_extractions(
+        [[winner], [first_dropped], [second_dropped]]
+    )
+
+    self.assertLen(result, 1)
+    self.assertIsNot(result[0], winner)
+    self.assertEqual(
+        result[0].dropped_attributes,
+        [
+            existing,
+            {"context": "same", "tags": ["one"]},
+            {"context": "same", "tags": ["one"]},
+        ],
+    )
+    self.assertEqual(winner.dropped_attributes, [existing])
+    self.assertEmpty(first_dropped.dropped_attributes)
+    self.assertIsNot(result[0].dropped_attributes[1], first_dropped.attributes)
+    self.assertIsNot(
+        result[0].dropped_attributes[1]["tags"],
+        first_dropped.attributes["tags"],
+    )
+
+  def test_dropped_attributes_attach_to_every_overlapping_winner(self):
+    first_winner = data.Extraction(
+        "winner",
+        "first",
+        char_interval=data.CharInterval(0, 10),
+    )
+    second_winner = data.Extraction(
+        "winner",
+        "second",
+        char_interval=data.CharInterval(10, 20),
+    )
+    dropped = data.Extraction(
+        "partial",
+        "bridge",
+        char_interval=data.CharInterval(9, 11),
+        attributes={"context": "shared", "beneficiary": "patient"},
+    )
+
+    result = annotation._merge_non_overlapping_extractions(
+        [[first_winner, second_winner], [dropped]]
+    )
+
+    self.assertEqual(
+        [extraction.dropped_attributes for extraction in result],
+        [
+            [{"context": "shared", "beneficiary": "patient"}],
+            [{"context": "shared", "beneficiary": "patient"}],
+        ],
+    )
+
+  def test_dropped_extractions_without_attributes_add_no_entry(self):
+    winner = data.Extraction(
+        "winner",
+        "full span",
+        char_interval=data.CharInterval(0, 20),
+    )
+    dropped = data.Extraction(
+        "partial",
+        "partial span",
+        char_interval=data.CharInterval(2, 5),
+    )
+
+    result = annotation._merge_non_overlapping_extractions(
+        [[winner], [dropped]]
+    )
+
+    self.assertIs(result[0], winner)
+    self.assertEmpty(result[0].dropped_attributes)
 
   @parameterized.named_parameters(
       dict(

@@ -153,9 +153,9 @@ relationship: 879 (21.5%)
 
 ### Sequential extraction passes
 
-Multiple extraction passes improve recall by performing independent extractions and merging non-overlapping results. Each pass uses identical parameters and processing—they are independent runs of the same extraction task. The number of passes is controlled by the `extraction_passes` parameter (e.g., `extraction_passes=3`).
+Multiple extraction passes improve recall by performing independent extractions and merging overlapping results with the largest span retained. With an integer `max_char_buffer`, every pass uses the same chunk size. A list such as `max_char_buffer=[750, 1000, 1250]` supplies one deterministic size per pass and must match `extraction_passes` in length.
 
-**How it works**: Each pass processes the full text independently using the same prompt and examples. Results are then merged using a "first-pass wins" strategy for overlapping entities, while adding unique non-overlapping entities from later passes. This approach captures entities that might be missed in any single run due to the stochastic nature of language model generation.
+**How it works**: Each pass processes the full text independently using the same prompt and examples. For overlapping results, the largest character span is retained, with earlier discovery breaking ties. The retained extraction's `dropped_attributes` list records attributes from each overlapping result that was discarded. This approach captures entities that might be missed in any single run due to the stochastic nature of language model generation.
 
 ### Portable and Interoperable Data with JSONL
 LangExtract uses JSONL, a human-readable format ideal for language model data. Each line is a self-contained JSON object, making outputs easy to parse, share, and integrate with other tools. You can save results with `lx.io.save_annotated_documents` and reload them for later analysis, ensuring your data is both portable and persistent.

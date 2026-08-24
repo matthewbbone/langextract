@@ -60,6 +60,7 @@ class DataLibToDictParameterizedTest(parameterized.TestCase):
                       "group_index": 0,
                       "description": None,
                       "attributes": None,
+                      "dropped_attributes": [],
                   },
               ],
               "text": "Just a short sentence.",
@@ -102,6 +103,7 @@ class DataLibToDictParameterizedTest(parameterized.TestCase):
                       "group_index": 0,
                       "description": None,
                       "attributes": None,
+                      "dropped_attributes": [],
                   },
                   {
                       "extraction_class": "symptom",
@@ -112,6 +114,7 @@ class DataLibToDictParameterizedTest(parameterized.TestCase):
                       "group_index": 0,
                       "description": None,
                       "attributes": None,
+                      "dropped_attributes": [],
                   },
               ],
               "text": "Patient Jane reported a headache.",
@@ -161,6 +164,7 @@ class DataLibToDictParameterizedTest(parameterized.TestCase):
                           "severity": "mild",
                           "persistence": "persistent",
                       },
+                      "dropped_attributes": [],
                   },
                   {
                       "extraction_class": "symptom",
@@ -171,6 +175,7 @@ class DataLibToDictParameterizedTest(parameterized.TestCase):
                       "group_index": 1,
                       "description": None,
                       "attributes": None,
+                      "dropped_attributes": [],
                   },
               ],
               "text": "He has mild chest pain and a cough.",
@@ -202,6 +207,48 @@ class DataLibToDictParameterizedTest(parameterized.TestCase):
 
     json_str = json.dumps(doc_dict, ensure_ascii=False)
     self.assertIn('"extraction_index": 42', json_str)
+
+  def test_dropped_attributes_round_trip(self):
+    document = data.AnnotatedDocument(
+        document_id="doc_dropped",
+        text="A relationship.",
+        extractions=[
+            data.Extraction(
+                "relationship",
+                "A relationship",
+                dropped_attributes=[
+                    {"context": "work", "beneficiary": "patient"},
+                    {"tags": ["duplicate", "candidate"]},
+                ],
+            )
+        ],
+    )
+
+    serialized = data_lib.annotated_document_to_dict(document)
+    restored = data_lib.dict_to_annotated_document(serialized)
+
+    self.assertEqual(
+        restored.extractions[0].dropped_attributes,
+        [
+            {"context": "work", "beneficiary": "patient"},
+            {"tags": ["duplicate", "candidate"]},
+        ],
+    )
+
+  def test_old_document_without_dropped_attributes_round_trip(self):
+    old_document = {
+        "document_id": "legacy",
+        "text": "Legacy text.",
+        "extractions": [{
+            "extraction_class": "note",
+            "extraction_text": "Legacy text",
+            "attributes": {"source": "old"},
+        }],
+    }
+
+    restored = data_lib.dict_to_annotated_document(old_document)
+
+    self.assertEmpty(restored.extractions[0].dropped_attributes)
 
 
 class IsUrlTest(absltest.TestCase):

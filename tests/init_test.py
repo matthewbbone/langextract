@@ -247,6 +247,37 @@ class InitTest(parameterized.TestCase):
     self.assertTrue(kwargs.get("suppress_parse_errors"))
     self.assertFalse(kwargs.get("enable_fuzzy_alignment"))
 
+  @mock.patch("langextract.annotation.Annotator.annotate_text")
+  @mock.patch("langextract.extraction.factory.create_model")
+  def test_extract_forwards_chunk_size_schedule(
+      self, mock_create_model, mock_annotate
+  ):
+    mock_model = mock.MagicMock()
+    mock_model.requires_fence_output = False
+    mock_model.schema = None
+    mock_create_model.return_value = mock_model
+    mock_annotate.return_value = lx.data.AnnotatedDocument(
+        text="test", extractions=[]
+    )
+
+    lx.extract(
+        text_or_documents="test text",
+        prompt_description="extract entities",
+        examples=[
+            lx.data.ExampleData(
+                text="Example text",
+                extractions=[lx.data.Extraction("entity", "Example")],
+            )
+        ],
+        api_key="test_key",
+        max_char_buffer=[100, 200, 300],
+        extraction_passes=3,
+    )
+
+    _, kwargs = mock_annotate.call_args
+    self.assertEqual(kwargs["max_char_buffer"], [100, 200, 300])
+    self.assertEqual(kwargs["extraction_passes"], 3)
+
   @parameterized.named_parameters(
       dict(
           testcase_name="default_true",

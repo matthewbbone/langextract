@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import collections
 from collections.abc import Iterable, Iterator
+import copy
 import time
 from typing import DefaultDict
 
@@ -41,6 +42,43 @@ from langextract.core import data
 from langextract.core import exceptions
 from langextract.core import format_handler as fh
 from langextract.core import tokenizer as tokenizer_lib
+
+
+def _normalize_max_char_buffer_schedule(
+    max_char_buffer: int | list[int], extraction_passes: int
+) -> list[int]:
+  """Validates and expands max_char_buffer into one size per pass."""
+  if not isinstance(extraction_passes, int) or isinstance(
+      extraction_passes, bool
+  ):
+    raise TypeError("extraction_passes must be an integer.")
+  if extraction_passes <= 0:
+    raise ValueError("extraction_passes must be greater than 0.")
+
+  if isinstance(max_char_buffer, int) and not isinstance(max_char_buffer, bool):
+    if max_char_buffer <= 0:
+      raise ValueError("max_char_buffer must be greater than 0.")
+    return [max_char_buffer] * extraction_passes
+
+  if not isinstance(max_char_buffer, list):
+    raise TypeError("max_char_buffer must be an integer or a list of integers.")
+  if len(max_char_buffer) != extraction_passes:
+    raise ValueError(
+        "max_char_buffer schedule length must equal extraction_passes: "
+        f"expected {extraction_passes}, got {len(max_char_buffer)}."
+    )
+  for pass_index, char_limit in enumerate(max_char_buffer):
+    if not isinstance(char_limit, int) or isinstance(char_limit, bool):
+      raise TypeError(
+          "max_char_buffer schedule values must be integers; "
+          f"entry {pass_index} is {type(char_limit).__name__}."
+      )
+    if char_limit <= 0:
+      raise ValueError(
+          "max_char_buffer schedule values must be greater than 0; "
+          f"entry {pass_index} is {char_limit}."
+      )
+  return list(max_char_buffer)
 
 
 def _span_length(extraction: data.Extraction) -> int:
@@ -67,8 +105,9 @@ def _merge_non_overlapping_extractions(
   the extraction with the largest character span is kept (largest-span-wins
   strategy); ties are broken toward earlier passes and earlier positions. This
   prevents a full target span found in one pass from being displaced by a
-  smaller, partial span found in another pass. Extractions are returned in
-  their original discovery order (pass order, then within-pass order).
+  smaller, partial span found in another pass. Attributes from each dropped
+  extraction are copied to every overlapping winner. Extractions are returned
+  in their original discovery order (pass order, then within-pass order).
 
   Args:
     all_extractions: List of extraction iterables from different sequential
@@ -76,7 +115,7 @@ def _merge_non_overlapping_extractions(
 
   Returns:
     List of merged extractions with overlaps resolved in favor of the largest
-    span.
+    span and dropped attributes recorded on retained winners.
   """
   if not all_extractions:
     return []
@@ -104,9 +143,25 @@ def _merge_non_overlapping_extractions(
       continue
     kept.append((original_index, extraction))
 
+  kept_indices = {original_index for original_index, _ in kept}
+  enriched: dict[int, data.Extraction] = {}
+  for dropped_index, dropped in enumerate(flat_extractions):
+    if dropped_index in kept_indices or not dropped.attributes:
+      continue
+    for kept_index, winner in kept:
+      if not _extractions_overlap(dropped, winner):
+        continue
+      enriched_winner = enriched.get(kept_index)
+      if enriched_winner is None:
+        enriched_winner = copy.deepcopy(winner)
+        enriched[kept_index] = enriched_winner
+      enriched_winner.dropped_attributes.append(
+          copy.deepcopy(dropped.attributes)
+      )
+
   # Restore original discovery order for the returned extractions.
   kept.sort(key=lambda pair: pair[0])
-  return [extraction for _, extraction in kept]
+  return [enriched.get(index, extraction) for index, extraction in kept]
 
 
 def _extractions_overlap(
@@ -145,7 +200,6 @@ def _document_chunk_iterator(
     max_char_buffer: int,
     restrict_repeats: bool = True,
     tokenizer: tokenizer_lib.Tokenizer | None = None,
-    first_chunk_max_char: int | None = None,
 ) -> Iterator[chunking.TextChunk]:
   """Iterates over documents to yield text chunks along with the document ID.
 
@@ -155,9 +209,6 @@ def _document_chunk_iterator(
     restrict_repeats: Whether to restrict the same document id from being
       visited more than once.
     tokenizer: Optional tokenizer instance.
-    first_chunk_max_char: Optional smaller buffer for the first chunk of each
-      document, shifting subsequent chunk boundaries. Forwarded to
-      ChunkIterator. None (default) leaves chunking unchanged.
 
   Yields:
     TextChunk containing document ID for a corresponding document.
@@ -183,7 +234,6 @@ def _document_chunk_iterator(
         max_char_buffer=max_char_buffer,
         document=document,
         tokenizer_impl=tokenizer or tokenizer_lib.RegexTokenizer(),
-        first_chunk_max_char=first_chunk_max_char,
     )
     visited_ids.add(document_id)
 
@@ -240,7 +290,7 @@ class Annotator:
       self,
       documents: Iterable[data.Document],
       resolver: resolver_lib.AbstractResolver | None = None,
-      max_char_buffer: int = 200,
+      max_char_buffer: int | list[int] = 200,
       batch_length: int = 1,
       debug: bool = True,
       extraction_passes: int = 1,
@@ -260,19 +310,19 @@ class Annotator:
       documents: Documents to annotate. Each document is expected to have a
         unique document_id.
       resolver: Resolver to use for extracting information from text.
-      max_char_buffer: Max number of characters that we can run inference on.
-        The text is split with Markdown-aware recursive chunking up to this
-        length, except when an indivisible source token is longer.
+      max_char_buffer: Maximum characters per inference chunk. An integer is
+        used for every extraction pass. A list supplies one limit per pass and
+        must have the same length as extraction_passes. An indivisible source
+        token may exceed its pass's limit.
       batch_length: Number of chunks to process in a single batch.
       debug: Whether to populate debug fields.
       extraction_passes: Number of sequential extraction attempts to improve
         recall by finding additional entities. Defaults to 1, which performs
         standard single extraction. Values > 1 reprocess tokens multiple times,
         potentially increasing costs with the potential for a more thorough
-        extraction. Each pass after the first shifts its chunk boundaries by a
-        deterministic offset of max_char_buffer // extraction_passes so spans
-        split at a boundary in one pass can land whole in another; overlapping
-        results are merged with the largest span winning.
+        extraction. When max_char_buffer is a list, each pass uses its
+        corresponding chunk size. Overlapping results are merged with the
+        largest span winning.
       context_window_chars: Number of characters from the previous chunk to
         include as context for the current chunk. Helps with coreference
         resolution across chunk boundaries. Defaults to None (disabled).
@@ -285,16 +335,20 @@ class Annotator:
       Resolved annotations from input documents.
 
     Raises:
-      ValueError: If there are no scored outputs during inference.
+      TypeError: If chunk sizes or extraction_passes have invalid types.
+      ValueError: If the schedule is invalid or inference has no outputs.
     """
     if resolver is None:
       resolver = resolver_lib.Resolver(format_type=data.FormatType.YAML)
 
+    max_char_buffer_schedule = _normalize_max_char_buffer_schedule(
+        max_char_buffer, extraction_passes
+    )
     if extraction_passes == 1:
       yield from self._annotate_documents_single_pass(
           documents,
           resolver,
-          max_char_buffer,
+          max_char_buffer_schedule[0],
           batch_length,
           debug,
           show_progress,
@@ -306,7 +360,7 @@ class Annotator:
       yield from self._annotate_documents_sequential_passes(
           documents,
           resolver,
-          max_char_buffer,
+          max_char_buffer_schedule,
           batch_length,
           debug,
           extraction_passes,
@@ -327,7 +381,6 @@ class Annotator:
       context_window_chars: int | None = None,
       tokenizer: tokenizer_lib.Tokenizer | None = None,
       suppress_parse_errors: bool = False,
-      first_chunk_max_char: int | None = None,
       **kwargs,
   ) -> Iterator[data.AnnotatedDocument]:
     """Single-pass annotation with stable ordering and streaming emission.
@@ -384,7 +437,6 @@ class Annotator:
         _capture_docs(documents),
         max_char_buffer,
         tokenizer=tokenizer,
-        first_chunk_max_char=first_chunk_max_char,
     )
     batches = chunking.make_batches_of_textchunk(chunk_iter, batch_length)
 
@@ -486,7 +538,7 @@ class Annotator:
       self,
       documents: Iterable[data.Document],
       resolver: resolver_lib.AbstractResolver,
-      max_char_buffer: int,
+      max_char_buffer_schedule: list[int],
       batch_length: int,
       debug: bool,
       extraction_passes: int,
@@ -505,9 +557,8 @@ class Annotator:
 
     document_list = list(documents)
 
-    # Reuse the configured tokenization across passes. ChunkIterator attaches
-    # each TokenizedText to its Document, and subsequent passes only change the
-    # Chonkie character boundary used for the first chunk.
+    # Reuse the configured tokenization across passes. Each pass changes only
+    # the Chonkie character chunk size.
     pass_tokenizer = tokenizer
     if tokenizer is not None:
       for document in document_list:
@@ -521,30 +572,20 @@ class Annotator:
     for _doc in document_list:
       document_texts[_doc.document_id] = _doc.text or ""
 
-    # Shift each pass's chunk boundaries by a deterministic offset so a span
-    # cut at a boundary in one pass can land whole in another. Pass 0 always
-    # uses the exact, unshifted baseline. adjustment is 0 only when
-    # extraction_passes > max_char_buffer, in which case every pass falls back
-    # to identical baseline chunking.
-    adjustment = max_char_buffer // extraction_passes
-
-    for pass_num in range(extraction_passes):
+    for pass_num, pass_max_char_buffer in enumerate(max_char_buffer_schedule):
       logging.info(
           "Starting extraction pass %d of %d", pass_num + 1, extraction_passes
       )
 
-      pass_offset = pass_num * adjustment
-
       for annotated_doc in self._annotate_documents_single_pass(
           document_list,
           resolver,
-          max_char_buffer,
+          pass_max_char_buffer,
           batch_length,
           debug=(debug and pass_num == 0),
           show_progress=show_progress if pass_num == 0 else False,
           context_window_chars=context_window_chars,
           tokenizer=pass_tokenizer,
-          first_chunk_max_char=(pass_offset if pass_offset > 0 else None),
           **kwargs,
       ):
         doc_id = annotated_doc.document_id
@@ -590,7 +631,7 @@ class Annotator:
       self,
       text: str,
       resolver: resolver_lib.AbstractResolver | None = None,
-      max_char_buffer: int = 200,
+      max_char_buffer: int | list[int] = 200,
       batch_length: int = 1,
       additional_context: str | None = None,
       debug: bool = True,
@@ -605,19 +646,18 @@ class Annotator:
     Args:
       text: Source text to annotate.
       resolver: Resolver to use for extracting information from text.
-      max_char_buffer: Max number of characters that we can run inference on.
-        The text is split with Markdown-aware recursive chunking up to this
-        length, except when an indivisible source token is longer.
+      max_char_buffer: Maximum characters per inference chunk. An integer is
+        used for every extraction pass. A list supplies one limit per pass and
+        must have the same length as extraction_passes. An indivisible source
+        token may exceed its pass's limit.
       batch_length: Number of chunks to process in a single batch.
       additional_context: Additional context to supplement prompt instructions.
       debug: Whether to populate debug fields.
       extraction_passes: Number of sequential extraction passes to improve
         recall by finding additional entities. Defaults to 1, which performs
         standard single extraction. Values > 1 reprocess tokens multiple times,
-        potentially increasing costs. Each pass after the first shifts its
-        chunk boundaries by a deterministic offset of
-        max_char_buffer // extraction_passes so spans split at a boundary in
-        one pass can land whole in another; overlapping results are merged with
+        potentially increasing costs. When max_char_buffer is a list, each pass
+        uses its corresponding chunk size. Overlapping results are merged with
         the largest span winning.
       context_window_chars: Number of characters from the previous chunk to
         include as context for coreference resolution. Defaults to None
@@ -629,6 +669,9 @@ class Annotator:
     Returns:
       Resolved annotations from text for document.
     """
+    max_char_buffer_schedule = _normalize_max_char_buffer_schedule(
+        max_char_buffer, extraction_passes
+    )
     if resolver is None:
       resolver = resolver_lib.Resolver(
           format_type=data.FormatType.YAML,
@@ -668,8 +711,9 @@ class Annotator:
       unique_classes = len(
           set(e.extraction_class for e in annotations[0].extractions)
       )
-      num_chunks = len(text) // max_char_buffer + (
-          1 if len(text) % max_char_buffer else 0
+      summary_char_limit = max_char_buffer_schedule[0]
+      num_chunks = len(text) // summary_char_limit + (
+          1 if len(text) % summary_char_limit else 0
       )
 
       progress.print_extraction_summary(

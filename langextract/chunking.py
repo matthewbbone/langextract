@@ -396,7 +396,6 @@ class ChunkIterator:
       max_char_buffer: int,
       tokenizer_impl: tokenizer_lib.Tokenizer,
       document: data.Document | None = None,
-      first_chunk_max_char: int | None = None,
   ):
     """Constructor.
 
@@ -405,11 +404,6 @@ class ChunkIterator:
       max_char_buffer: Size of buffer that we can run inference on.
       tokenizer_impl: Tokenizer instance to use.
       document: Optional source document.
-      first_chunk_max_char: Optional smaller buffer applied to the first chunk
-        only. Used to shift all subsequent chunk boundaries by a fixed amount
-        across extraction passes so a span split at a boundary in one pass can
-        land whole in another. When None (default), every chunk uses
-        max_char_buffer and behavior is unchanged.
     """
     if text is None:
       if document is None:
@@ -425,7 +419,6 @@ class ChunkIterator:
     if max_char_buffer <= 0:
       raise ValueError("max_char_buffer must be greater than 0.")
     self.max_char_buffer = max_char_buffer
-    self.first_chunk_max_char = first_chunk_max_char
 
     # TODO: Refactor redundancy between document and text.
     if document is None:
@@ -452,36 +445,15 @@ class ChunkIterator:
     )
 
   def _candidate_chunk_boundaries(self) -> list[tuple[int, int]]:
-    """Returns absolute character ends and limits from Chonkie runs."""
+    """Returns absolute character ends from the Chonkie run."""
     source_text = self.tokenized_text.text
     if not source_text:
       return []
 
-    first_limit = self.first_chunk_max_char
-    if first_limit is None:
-      chunks = self._create_recursive_chunker(self.max_char_buffer).chunk(
-          source_text
-      )
-      return [(chunk.end_index, self.max_char_buffer) for chunk in chunks]
-
-    effective_first_limit = max(1, first_limit)
-    first_chunks = self._create_recursive_chunker(effective_first_limit).chunk(
+    chunks = self._create_recursive_chunker(self.max_char_buffer).chunk(
         source_text
     )
-    if not first_chunks:
-      return []
-
-    first_end = first_chunks[0].end_index
-    candidate_boundaries = [(first_end, effective_first_limit)]
-    if first_end < len(source_text):
-      remaining_chunks = self._create_recursive_chunker(
-          self.max_char_buffer
-      ).chunk(source_text[first_end:])
-      candidate_boundaries.extend(
-          (first_end + chunk.end_index, self.max_char_buffer)
-          for chunk in remaining_chunks
-      )
-    return candidate_boundaries
+    return [(chunk.end_index, self.max_char_buffer) for chunk in chunks]
 
   def _token_end_for_char_boundary(
       self,

@@ -50,7 +50,7 @@ def extract(
     api_key: str | None = None,
     language_model_type: typing.Type[typing.Any] | None = None,
     format_type: typing.Any = None,
-    max_char_buffer: int = 1000,
+    max_char_buffer: int | list[int] = 1000,
     temperature: float | None = None,
     fence_output: bool | None = None,
     use_schema_constraints: bool = True,
@@ -107,9 +107,11 @@ def extract(
         (GeminiLanguageModel). This parameter will be removed in v2.0.0. Use
         the model, config, or model_id parameters instead.
       format_type: The format type for the output (JSON or YAML).
-      max_char_buffer: Max number of characters for inference. Documents are
-        split with Chonkie's Markdown RecursiveChunker; an indivisible source
-        token may exceed this limit.
+      max_char_buffer: Maximum characters per inference chunk. An integer is
+        used for every extraction pass. A list supplies one limit per pass and
+        must have the same length as extraction_passes. Documents are split
+        with Chonkie's Markdown RecursiveChunker; an indivisible source token
+        may exceed its pass's limit.
       temperature: The sampling temperature for generation. When None (default),
         uses the model's default temperature. Set to 0.0 for deterministic output
         or higher values for more variation.
@@ -159,12 +161,11 @@ def extract(
       extraction_passes: Number of sequential extraction attempts to improve
         recall and find additional entities. Defaults to 1 (standard single
         extraction). When > 1, the system performs multiple extraction passes
-        whose chunk boundaries are shifted by a deterministic per-pass offset
-        (so a span split at a boundary in one pass can land whole in another)
         and merges the results; when spans overlap the largest span wins, with
-        ties broken toward earlier passes. WARNING: Each additional pass
-        reprocesses tokens, potentially increasing API costs. For example,
-        extraction_passes=3 reprocesses tokens 3x.
+        ties broken toward earlier passes. A max_char_buffer list can vary the
+        chunk size by pass. WARNING: Each additional pass reprocesses tokens,
+        potentially increasing API costs. For example, extraction_passes=3
+        reprocesses tokens 3x.
       context_window_chars: Number of characters from the previous chunk to
         include as context for the current chunk. This helps with coreference
         resolution across chunk boundaries (e.g., resolving "She" to a person

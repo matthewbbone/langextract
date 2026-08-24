@@ -78,7 +78,9 @@ class Extraction:
     extraction_index: The index of the extraction in the list of extractions.
     group_index: The index of the group the extraction belongs to.
     description: A description of the extraction.
-    attributes: A list of attributes of the extraction.
+    attributes: Attributes of the extraction.
+    dropped_attributes: Attributes from overlapping extractions discarded
+      during multipass deduplication.
     token_interval: The token interval of the extraction.
   """
 
@@ -90,6 +92,9 @@ class Extraction:
   group_index: int | None = None
   description: str | None = None
   attributes: dict[str, str | list[str]] | None = None
+  dropped_attributes: list[dict[str, str | list[str]]] = dataclasses.field(
+      default_factory=list
+  )
   _token_interval: tokenizer.TokenInterval | None = dataclasses.field(
       default=None, repr=False, compare=False
   )
@@ -106,6 +111,7 @@ class Extraction:
       group_index: int | None = None,
       description: str | None = None,
       attributes: dict[str, str | list[str]] | None = None,
+      dropped_attributes: list[dict[str, str | list[str]]] | None = None,
   ):
     self.extraction_class = extraction_class
     self.extraction_text = extraction_text
@@ -116,6 +122,7 @@ class Extraction:
     self.group_index = group_index
     self.description = description
     self.attributes = attributes
+    self.dropped_attributes = list(dropped_attributes or [])
 
   @property
   def token_interval(self) -> tokenizer.TokenInterval | None:
