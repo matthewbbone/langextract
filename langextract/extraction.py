@@ -88,8 +88,9 @@ def extract(
       prompt_description: Instructions for what to extract from the text.
       examples: List of ExampleData objects to guide the extraction.
         Required unless `output_schema` is provided.
-      tokenizer: Optional Tokenizer instance to use for chunking and alignment.
-        If None, defaults to RegexTokenizer.
+      tokenizer: Optional Tokenizer instance used to normalize Markdown-aware
+        character chunk boundaries to LangExtract tokens and for extraction
+        alignment. If None, defaults to RegexTokenizer.
       api_key: API key for Gemini or other LLM services (can also use
         environment variable LANGEXTRACT_API_KEY). Cost considerations: Most
         APIs charge by token volume. Smaller max_char_buffer values increase the
@@ -106,7 +107,9 @@ def extract(
         (GeminiLanguageModel). This parameter will be removed in v2.0.0. Use
         the model, config, or model_id parameters instead.
       format_type: The format type for the output (JSON or YAML).
-      max_char_buffer: Max number of characters for inference.
+      max_char_buffer: Max number of characters for inference. Documents are
+        split with Chonkie's Markdown RecursiveChunker; an indivisible source
+        token may exceed this limit.
       temperature: The sampling temperature for generation. When None (default),
         uses the model's default temperature. Set to 0.0 for deterministic output
         or higher values for more variation.

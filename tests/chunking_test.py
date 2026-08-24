@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from importlib import resources
+import hashlib
+import json
 import textwrap
 from unittest import mock
 
@@ -76,19 +79,27 @@ class ChunkIteratorTest(absltest.TestCase):
     )
     chunk_interval = next(chunk_iter).token_interval
     self.assertEqual(
-        tokenizer.TokenInterval(start_index=0, end_index=11), chunk_interval
+        tokenizer.TokenInterval(start_index=0, end_index=13), chunk_interval
     )
     self.assertEqual(
         chunking.get_token_interval_text(tokenized_text, chunk_interval),
-        "This is a sentence. This is a longer sentence.",
+        "This is a sentence. This is a longer sentence. Mr.",
     )
     chunk_interval = next(chunk_iter).token_interval
     self.assertEqual(
-        tokenizer.TokenInterval(start_index=11, end_index=17), chunk_interval
+        tokenizer.TokenInterval(start_index=13, end_index=14), chunk_interval
     )
     self.assertEqual(
         chunking.get_token_interval_text(tokenized_text, chunk_interval),
-        "Mr. Bond\nasks\nwhy?",
+        "Bond",
+    )
+    chunk_interval = next(chunk_iter).token_interval
+    self.assertEqual(
+        tokenizer.TokenInterval(start_index=14, end_index=17), chunk_interval
+    )
+    self.assertEqual(
+        chunking.get_token_interval_text(tokenized_text, chunk_interval),
+        "asks\nwhy?",
     )
     with self.assertRaises(StopIteration):
       next(chunk_iter)
@@ -338,8 +349,131 @@ class ChunkIteratorTest(absltest.TestCase):
     )
     text_chunk = next(chunk_iter)
 
+    mock_tokenizer.tokenize.assert_called_once_with(text)
     self.assertEqual(text_chunk.document_text, mock_tokenized_text)
     self.assertEqual(text_chunk.chunk_text, text)
+
+  def test_whitespace_only_text_has_no_chunks(self):
+    chunks = list(
+        chunking.ChunkIterator(
+            " \n\t ",
+            max_char_buffer=10,
+            tokenizer_impl=tokenizer.RegexTokenizer(),
+        )
+    )
+    self.assertEmpty(chunks)
+
+
+class MarkdownRecursiveChunkerTest(absltest.TestCase):
+
+  def test_bundled_recipe_identity_and_checksum(self):
+    recipe_path = resources.files("langextract").joinpath(
+        "resources/chonkie_markdown_en.json"
+    )
+    attribution_path = resources.files("langextract").joinpath(
+        "resources/chonkie_markdown_en.txt"
+    )
+    recipe_bytes = recipe_path.read_bytes()
+    recipe = json.loads(recipe_bytes)
+    attribution = attribution_path.read_text(encoding="utf-8")
+
+    self.assertEqual(recipe["name"], "markdown")
+    self.assertEqual(recipe["language"], "en")
+    self.assertEqual(recipe["metadata"]["version"], "0.1.0")
+    self.assertEqual(
+        hashlib.sha256(recipe_bytes).hexdigest(),
+        "a822a923bcb559a87a2106633cabb6f65b090a46c7131dbb744a6c07749d32be",
+    )
+    self.assertIn(
+        "Revision: 1f982aa76473ec865eb54ab0729fe6a703e59937", attribution
+    )
+    self.assertIn("Apache License 2.0", attribution)
+
+  def test_cjk_chunks_have_contiguous_token_coverage(self):
+    text = "# 症状\n\n患者有发热和咳嗽。患者需要休息。"
+    tokenized_text = tokenizer.tokenize(text)
+    chunks = list(
+        chunking.ChunkIterator(
+            tokenized_text,
+            max_char_buffer=12,
+            tokenizer_impl=tokenizer.RegexTokenizer(),
+        )
+    )
+
+    intervals = [chunk.token_interval for chunk in chunks]
+    self.assertEqual(intervals[0].start_index, 0)
+    self.assertEqual(intervals[-1].end_index, len(tokenized_text.tokens))
+    for previous, current in zip(intervals, intervals[1:]):
+      self.assertEqual(previous.end_index, current.start_index)
+
+  def test_recursive_chunker_uses_character_sizing_and_markdown_rules(self):
+    text = "# Heading\n\nBody text."
+    with mock.patch.object(chunking, "RecursiveChunker") as chunker_cls:
+      chunker_cls.return_value.chunk.return_value = [
+          mock.Mock(end_index=len(text))
+      ]
+      chunks = list(
+          chunking.ChunkIterator(
+              text,
+              max_char_buffer=42,
+              tokenizer_impl=tokenizer.RegexTokenizer(),
+          )
+      )
+
+    self.assertLen(chunks, 1)
+    chunker_cls.assert_called_once_with(
+        tokenizer="character",
+        chunk_size=42,
+        rules=mock.ANY,
+        min_characters_per_chunk=1,
+    )
+    rules = chunker_cls.call_args.kwargs["rules"]
+    self.assertEqual(
+        rules.levels[0].delimiters,
+        ["######", "#####", "####", "###", "##", "#"],
+    )
+
+  def test_markdown_recipe_preserves_structural_blocks(self):
+    text = textwrap.dedent("""\
+        # Guide
+
+        Intro paragraph with `inline code` and punctuation!
+
+        ## Steps
+
+        - First item
+        - Second item
+
+        ```python
+        print("hello")
+        ```
+        """)
+    chunks = list(
+        chunking.ChunkIterator(
+            text,
+            max_char_buffer=60,
+            tokenizer_impl=tokenizer.RegexTokenizer(),
+        )
+    )
+
+    self.assertEqual(
+        [chunk.chunk_text for chunk in chunks],
+        [
+            "# Guide",
+            "Intro paragraph with `inline code` and punctuation!",
+            "## Steps\n\n- First item\n- Second item",
+            '```python\nprint("hello")\n```',
+        ],
+    )
+    total_tokens = len(tokenizer.tokenize(text).tokens)
+    self.assertEqual(chunks[0].token_interval.start_index, 0)
+    self.assertEqual(chunks[-1].token_interval.end_index, total_tokens)
+    for previous, current in zip(chunks, chunks[1:]):
+      self.assertEqual(
+          previous.token_interval.end_index,
+          current.token_interval.start_index,
+      )
+    self.assertTrue(all(len(chunk.chunk_text) <= 60 for chunk in chunks))
 
 
 class ChunkIteratorFirstChunkOffsetTest(absltest.TestCase):
@@ -481,13 +615,13 @@ class BatchingTest(parameterized.TestCase):
               ),
               chunking.TextChunk(
                   token_interval=tokenizer.TokenInterval(
-                      start_index=5, end_index=7
+                      start_index=5, end_index=6
                   ),
                   document=_SAMPLE_DOCUMENT,
               ),
               chunking.TextChunk(
                   token_interval=tokenizer.TokenInterval(
-                      start_index=7, end_index=10
+                      start_index=6, end_index=10
                   ),
                   document=_SAMPLE_DOCUMENT,
               ),

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Library for breaking documents into chunks of sentences.
+"""Library for breaking documents into Markdown-aware text chunks.
 
 When a text-to-text model (e.g. a large language model with a fixed context
 size) can not accommodate a large document, this library can help us break the
@@ -20,16 +20,59 @@ document into chunks of a required maximum length that we can perform
 inference on.
 """
 
+import bisect
 from collections.abc import Iterable, Iterator, Sequence
 import dataclasses
+from importlib import resources
+import functools
+import json
 import re
 
 from absl import logging
+from chonkie import RecursiveChunker
+from chonkie import RecursiveRules
 import more_itertools
 
 from langextract.core import data
 from langextract.core import exceptions
 from langextract.core import tokenizer as tokenizer_lib
+
+_MARKDOWN_RECIPE_RESOURCE = "resources/chonkie_markdown_en.json"
+_MARKDOWN_RECIPE_NAME = "markdown"
+_MARKDOWN_RECIPE_LANGUAGE = "en"
+_MARKDOWN_RECIPE_VERSION = "0.1.0"
+
+
+@functools.lru_cache(maxsize=1)
+def _load_markdown_rules() -> RecursiveRules:
+  """Loads the pinned Chonkie English Markdown recipe from package data."""
+  recipe_path = resources.files("langextract").joinpath(
+      _MARKDOWN_RECIPE_RESOURCE
+  )
+  recipe_data = json.loads(recipe_path.read_text(encoding="utf-8"))
+  metadata = recipe_data.get("metadata", {})
+  identity = (
+      recipe_data.get("name"),
+      recipe_data.get("language"),
+      metadata.get("version"),
+  )
+  expected_identity = (
+      _MARKDOWN_RECIPE_NAME,
+      _MARKDOWN_RECIPE_LANGUAGE,
+      _MARKDOWN_RECIPE_VERSION,
+  )
+  if identity != expected_identity:
+    raise ValueError(
+        "Unexpected bundled Chonkie recipe identity: "
+        f"expected {expected_identity}, got {identity}."
+    )
+  try:
+    rules_data = recipe_data["recipe"]["recursive_rules"]
+  except (KeyError, TypeError) as e:
+    raise ValueError(
+        "Bundled Chonkie Markdown recipe has no recursive rules."
+    ) from e
+  return RecursiveRules.from_dict(rules_data)
 
 
 class TokenUtilError(exceptions.LangExtractError):
@@ -341,45 +384,10 @@ class SentenceIterator:
 
 
 class ChunkIterator:
-  r"""Iterate through chunks of a tokenized text.
+  """Iterates through Markdown-aware chunks produced by Chonkie.
 
-  Chunks may consist of sentences or sentence fragments that can fit into the
-  maximum character buffer that we can run inference on.
-
-  A)
-  If a sentence length exceeds the max char buffer, then it needs to be broken
-  into chunks that can fit within the max char buffer. We do this in a way that
-  maximizes the chunk length while respecting newlines (if present) and token
-  boundaries.
-  Consider this sentence from a poem by John Donne:
-  ```
-  No man is an island,
-  Entire of itself,
-  Every man is a piece of the continent,
-  A part of the main.
-  ```
-  With max_char_buffer=40, the chunks are:
-  * "No man is an island,\nEntire of itself," len=38
-  * "Every man is a piece of the continent," len=38
-  * "A part of the main." len=19
-
-  B)
-  If a single token exceeds the max char buffer, it comprises the whole chunk.
-  Consider the sentence:
-  "This is antidisestablishmentarianism."
-  With max_char_buffer=20, the chunks are:
-  * "This is" len=7
-  * "antidisestablishmentarianism" len=28
-  * "." len(1)
-
-  C)
-  If multiple *whole* sentences can fit within the max char buffer, then they
-  are used to form the chunk.
-  Consider the sentences:
-  "Roses are red. Violets are blue. Flowers are nice. And so are you."
-  With max_char_buffer=60, the chunks are:
-  * "Roses are red. Violets are blue. Flowers are nice." len=50
-  * "And so are you." len=15
+  Chonkie's character offsets are normalized to LangExtract token boundaries
+  so downstream alignment continues to use the existing TextChunk contract.
   """
 
   def __init__(
@@ -414,11 +422,10 @@ class ChunkIterator:
       text_to_tokenize = text.text or (document.text if document else "")
       text = tokenizer_impl.tokenize(text_to_tokenize)
     self.tokenized_text = text
+    if max_char_buffer <= 0:
+      raise ValueError("max_char_buffer must be greater than 0.")
     self.max_char_buffer = max_char_buffer
     self.first_chunk_max_char = first_chunk_max_char
-    self._chunk_count = 0
-    self.sentence_iter = SentenceIterator(self.tokenized_text)
-    self.broken_sentence = False
 
     # TODO: Refactor redundancy between document and text.
     if document is None:
@@ -426,107 +433,142 @@ class ChunkIterator:
     else:
       self.document = document
     self.document.tokenized_text = self.tokenized_text
+    self._chunk_iter = iter(self._build_chunks())
 
   def __iter__(self) -> Iterator[TextChunk]:
     return self
 
-  def _tokens_exceed_buffer(
-      self, token_interval: tokenizer_lib.TokenInterval
-  ) -> bool:
-    """Check if the token interval exceeds the maximum buffer size.
-
-    Args:
-      token_interval: Token interval to check.
-
-    Returns:
-      True if the token interval exceeds the maximum buffer size.
-    """
-    char_interval = get_char_interval(self.tokenized_text, token_interval)
-    return (
-        char_interval.end_pos - char_interval.start_pos
-    ) > self.max_char_buffer
-
   def __next__(self) -> TextChunk:
-    # The first chunk of a pass may use a smaller buffer so that all following
-    # chunk boundaries are shifted by that amount. Only the buffer value is
-    # swapped; the sentence iterator position and broken_sentence state carry
-    # over untouched, so chunking resumes seamlessly at the real buffer size.
-    if self._chunk_count == 0 and self.first_chunk_max_char is not None:
-      saved_buffer = self.max_char_buffer
-      self.max_char_buffer = max(1, self.first_chunk_max_char)
-      try:
-        chunk = self._next_chunk()
-      finally:
-        self.max_char_buffer = saved_buffer
-      self._chunk_count += 1
-      return chunk
+    return next(self._chunk_iter)
 
-    self._chunk_count += 1
-    return self._next_chunk()
-
-  def _next_chunk(self) -> TextChunk:
-    sentence = next(self.sentence_iter)
-    # If the next token is greater than the max_char_buffer, let it be the
-    # entire chunk.
-    curr_chunk = create_token_interval(
-        sentence.start_index, sentence.start_index + 1
+  @staticmethod
+  def _create_recursive_chunker(char_limit: int) -> RecursiveChunker:
+    """Creates a character-sized chunker with the pinned Markdown rules."""
+    return RecursiveChunker(
+        tokenizer="character",
+        chunk_size=char_limit,
+        rules=_load_markdown_rules(),
+        min_characters_per_chunk=1,
     )
-    if self._tokens_exceed_buffer(curr_chunk):
-      self.sentence_iter = SentenceIterator(
-          self.tokenized_text, curr_token_pos=sentence.start_index + 1
-      )
-      self.broken_sentence = curr_chunk.end_index < sentence.end_index
-      return TextChunk(
-          token_interval=curr_chunk,
-          document=self.document,
-      )
 
-    # Append tokens to the chunk up to the max_char_buffer.
-    start_of_new_line = -1
-    for token_index in range(curr_chunk.start_index, sentence.end_index):
-      if self.tokenized_text.tokens[token_index].first_token_after_newline:
-        start_of_new_line = token_index
-      test_chunk = create_token_interval(
-          curr_chunk.start_index, token_index + 1
+  def _candidate_chunk_boundaries(self) -> list[tuple[int, int]]:
+    """Returns absolute character ends and limits from Chonkie runs."""
+    source_text = self.tokenized_text.text
+    if not source_text:
+      return []
+
+    first_limit = self.first_chunk_max_char
+    if first_limit is None:
+      chunks = self._create_recursive_chunker(self.max_char_buffer).chunk(
+          source_text
       )
-      if self._tokens_exceed_buffer(test_chunk):
-        # Only break at newline if: 1) newline exists (> 0) and
-        # 2) it's after chunk start (prevents empty intervals)
-        if start_of_new_line > 0 and start_of_new_line > curr_chunk.start_index:
-          # Terminate the curr_chunk at the start of the most recent newline.
-          curr_chunk = create_token_interval(
-              curr_chunk.start_index, start_of_new_line
-          )
-        self.sentence_iter = SentenceIterator(
-            self.tokenized_text, curr_token_pos=curr_chunk.end_index
-        )
-        self.broken_sentence = True
-        return TextChunk(
-            token_interval=curr_chunk,
-            document=self.document,
-        )
+      return [(chunk.end_index, self.max_char_buffer) for chunk in chunks]
+
+    effective_first_limit = max(1, first_limit)
+    first_chunks = self._create_recursive_chunker(effective_first_limit).chunk(
+        source_text
+    )
+    if not first_chunks:
+      return []
+
+    first_end = first_chunks[0].end_index
+    candidate_boundaries = [(first_end, effective_first_limit)]
+    if first_end < len(source_text):
+      remaining_chunks = self._create_recursive_chunker(
+          self.max_char_buffer
+      ).chunk(source_text[first_end:])
+      candidate_boundaries.extend(
+          (first_end + chunk.end_index, self.max_char_buffer)
+          for chunk in remaining_chunks
+      )
+    return candidate_boundaries
+
+  def _token_end_for_char_boundary(
+      self,
+      char_end: int,
+      current_token: int,
+      token_starts: Sequence[int],
+  ) -> int:
+    """Snaps one Chonkie character boundary to a token boundary."""
+    tokens = self.tokenized_text.tokens
+    token_end = bisect.bisect_left(token_starts, char_end)
+    if token_end == 0:
+      return 0
+
+    split_token_index = token_end - 1
+    split_token = tokens[split_token_index]
+    split_interval = split_token.char_interval
+    if split_interval.start_pos < char_end < split_interval.end_pos:
+      if split_token_index > current_token:
+        return split_token_index
+      return split_token_index + 1
+    return token_end
+
+  def _text_chunks_for_interval(
+      self,
+      start_token: int,
+      end_token: int,
+      char_limit: int,
+      token_ends: Sequence[int],
+  ) -> list[TextChunk]:
+    """Creates size-limited TextChunks for one normalized interval."""
+    tokens = self.tokenized_text.tokens
+    chunks = []
+    while start_token < end_token:
+      start_char = tokens[start_token].char_interval.start_pos
+      interval_end_char = tokens[end_token - 1].char_interval.end_pos
+      if interval_end_char - start_char <= char_limit:
+        chunk_end = end_token
       else:
-        curr_chunk = test_chunk
-
-    if self.broken_sentence:
-      self.broken_sentence = False
-    else:
-      for sentence in self.sentence_iter:
-        test_chunk = create_token_interval(
-            curr_chunk.start_index, sentence.end_index
+        chunk_end = bisect.bisect_right(
+            token_ends,
+            start_char + char_limit,
+            lo=start_token,
+            hi=end_token,
         )
-        if self._tokens_exceed_buffer(test_chunk):
-          self.sentence_iter = SentenceIterator(
-              self.tokenized_text, curr_token_pos=curr_chunk.end_index
-          )
-          return TextChunk(
-              token_interval=curr_chunk,
+        if chunk_end == start_token:
+          # Preserve indivisible source tokens even when one exceeds the limit.
+          chunk_end += 1
+      chunks.append(
+          TextChunk(
+              token_interval=create_token_interval(start_token, chunk_end),
               document=self.document,
           )
-        else:
-          curr_chunk = test_chunk
+      )
+      start_token = chunk_end
+    return chunks
 
-    return TextChunk(
-        token_interval=curr_chunk,
-        document=self.document,
-    )
+  def _build_chunks(self) -> list[TextChunk]:
+    """Converts Chonkie character boundaries into LangExtract chunks."""
+    tokens = self.tokenized_text.tokens
+    if not tokens:
+      return []
+
+    token_starts = [token.char_interval.start_pos for token in tokens]
+    token_ends = [token.char_interval.end_pos for token in tokens]
+    current_token = 0
+    chunks = []
+    for char_end, char_limit in self._candidate_chunk_boundaries():
+      token_end = self._token_end_for_char_boundary(
+          char_end, current_token, token_starts
+      )
+      token_end = min(max(token_end, current_token), len(tokens))
+      if token_end == current_token:
+        continue
+      chunks.extend(
+          self._text_chunks_for_interval(
+              current_token, token_end, char_limit, token_ends
+          )
+      )
+      current_token = token_end
+
+    if current_token < len(tokens):
+      chunks.extend(
+          self._text_chunks_for_interval(
+              current_token,
+              len(tokens),
+              self.max_char_buffer,
+              token_ends,
+          )
+      )
+    return chunks

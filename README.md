@@ -175,6 +175,9 @@ result = lx.extract(
 
 This approach can extract hundreds of entities from full novels while maintaining high accuracy. The interactive visualization seamlessly handles large result sets, making it easy to explore hundreds of entities from the output JSONL file. **[See the full *Romeo and Juliet* extraction example →](https://github.com/google/langextract/blob/main/docs/examples/longer_text_example.md)** for detailed results and performance insights.
 
+Long documents are split with a Markdown-aware recursive hierarchy, preserving
+headings and document structure where the configured character limit permits.
+
 ### Vertex AI Batch Processing
 
 Save costs on large-scale tasks by enabling Vertex AI Batch API with

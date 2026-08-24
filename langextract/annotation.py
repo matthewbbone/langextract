@@ -261,7 +261,8 @@ class Annotator:
         unique document_id.
       resolver: Resolver to use for extracting information from text.
       max_char_buffer: Max number of characters that we can run inference on.
-        The text will be broken into chunks up to this length.
+        The text is split with Markdown-aware recursive chunking up to this
+        length, except when an indivisible source token is longer.
       batch_length: Number of chunks to process in a single batch.
       debug: Whether to populate debug fields.
       extraction_passes: Number of sequential extraction attempts to improve
@@ -504,6 +505,15 @@ class Annotator:
 
     document_list = list(documents)
 
+    # Reuse the configured tokenization across passes. ChunkIterator attaches
+    # each TokenizedText to its Document, and subsequent passes only change the
+    # Chonkie character boundary used for the first chunk.
+    pass_tokenizer = tokenizer
+    if tokenizer is not None:
+      for document in document_list:
+        document.tokenized_text = tokenizer.tokenize(document.text or "")
+      pass_tokenizer = None
+
     document_extractions_by_pass: dict[str, list[list[data.Extraction]]] = {}
     document_texts: dict[str, str] = {}
     # Preserve text up-front so we can emit documents even if later passes
@@ -533,7 +543,7 @@ class Annotator:
           debug=(debug and pass_num == 0),
           show_progress=show_progress if pass_num == 0 else False,
           context_window_chars=context_window_chars,
-          tokenizer=tokenizer,
+          tokenizer=pass_tokenizer,
           first_chunk_max_char=(pass_offset if pass_offset > 0 else None),
           **kwargs,
       ):
@@ -596,7 +606,8 @@ class Annotator:
       text: Source text to annotate.
       resolver: Resolver to use for extracting information from text.
       max_char_buffer: Max number of characters that we can run inference on.
-        The text will be broken into chunks up to this length.
+        The text is split with Markdown-aware recursive chunking up to this
+        length, except when an indivisible source token is longer.
       batch_length: Number of chunks to process in a single batch.
       additional_context: Additional context to supplement prompt instructions.
       debug: Whether to populate debug fields.

@@ -1,0 +1,19 @@
+Chonkie English Markdown recipe
+================================
+
+Source: https://huggingface.co/datasets/feyninc/recipes
+Revision: 1f982aa76473ec865eb54ab0729fe6a703e59937
+Original path: recipes/markdown.json
+Recipe name: markdown
+Recipe language: en
+Recipe version: 0.1.0
+Recipe author: Chonkie Team
+Upstream SHA-256: 8e81a8a05e513cf4601f8e379ecfc23fb30d3480f1716a98bd7c01d431342ca4
+Bundled SHA-256: a822a923bcb559a87a2106633cabb6f65b090a46c7131dbb744a6c07749d32be
+
+The recipe repository is licensed under the Apache License 2.0:
+https://www.apache.org/licenses/LICENSE-2.0
+
+The JSON data is bundled unchanged; the packaged file adds a final newline.
+Its filename in LangExtract includes the language code to make the selected
+recipe explicit.

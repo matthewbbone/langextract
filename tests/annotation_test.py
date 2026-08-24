@@ -566,6 +566,61 @@ class AnnotatorTest(absltest.TestCase):
         ),
     ])
 
+  def test_markdown_recursive_chunks_preserve_document_offsets(self):
+    text = (
+        "# Medications\n\nPatient takes Aspirin daily.\n\n"
+        "## Symptoms\n\nPatient reports fever."
+    )
+    self.mock_language_model.infer.side_effect = [
+        [[
+            types.ScoredOutput(
+                score=1.0,
+                output=f"```yaml\n{data.EXTRACTIONS_KEY}: []\n```",
+            )
+        ]],
+        [[
+            types.ScoredOutput(
+                score=1.0,
+                output=textwrap.dedent(f"""\
+                  ```yaml
+                  {data.EXTRACTIONS_KEY}:
+                  - medication: "Aspirin"
+                  ```"""),
+            )
+        ]],
+        [[
+            types.ScoredOutput(
+                score=1.0,
+                output=textwrap.dedent(f"""\
+                  ```yaml
+                  {data.EXTRACTIONS_KEY}:
+                  - condition: "fever"
+                  ```"""),
+            )
+        ]],
+    ]
+    resolver = resolver_lib.Resolver(format_type=data.FormatType.YAML)
+
+    result = self.annotator.annotate_text(
+        text,
+        max_char_buffer=35,
+        batch_length=1,
+        resolver=resolver,
+    )
+
+    self.assertEqual(
+        [extraction.extraction_text for extraction in result.extractions],
+        ["Aspirin", "fever"],
+    )
+    self.assertEqual(
+        [extraction.char_interval for extraction in result.extractions],
+        [
+            data.CharInterval(text.index("Aspirin"), text.index("Aspirin") + 7),
+            data.CharInterval(text.index("fever"), text.index("fever") + 5),
+        ],
+    )
+    self.assert_char_interval_match_source(text, result.extractions)
+
   def test_annotate_text_no_extractions(self):
     text = "Text without extractions."
     self.mock_language_model.infer.return_value = [[
@@ -1030,6 +1085,27 @@ class AnnotatorMultiPassTest(absltest.TestCase):
 
     # adjustment = 30 // 3 = 10; pass 0 is the unshifted baseline (None).
     self.assertEqual(captured_offsets, [None, 10, 20])
+
+  def test_multipass_custom_tokenizer_runs_once_per_document(self):
+    text = "# Status\n\nPatient has fever."
+    custom_tokenizer = mock.Mock(spec=tokenizer.Tokenizer)
+    custom_tokenizer.tokenize.return_value = tokenizer.tokenize(text)
+    self.mock_language_model.infer.return_value = [[
+        types.ScoredOutput(
+            score=1.0,
+            output=f"```yaml\n{data.EXTRACTIONS_KEY}: []\n```",
+        )
+    ]]
+
+    self.annotator.annotate_text(
+        text,
+        max_char_buffer=100,
+        extraction_passes=3,
+        tokenizer=custom_tokenizer,
+        debug=False,
+    )
+
+    custom_tokenizer.tokenize.assert_called_once_with(text)
 
 
 class MultiPassHelperFunctionsTest(parameterized.TestCase):
